@@ -1,0 +1,195 @@
+---
+title: "Practical Machine Learning- Final Project"
+author: "Doron Fingold"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+## Overview
+We try to predict the manner in which exercise was executed. This is the `classe` variable in the training dataset. The dataset includes observation from accelerometers on the belt, forearm, arm, and dumbell of 6 participants. See more [here](https://web.archive.org/web/20200730234422/http://groupware.les.inf.puc-rio.br/har).We will try and find the best model for predicting `classe`.
+
+```{r , message=FALSE, echo =FALSE}
+#libraries
+library(caret)
+library(scales)
+library(PerformanceAnalytics)
+library(dplyr)
+library(parallel)
+library(doParallel)
+library(pROC)
+library(likert)
+library(gridExtra)
+library(grid)
+#seed 379
+set.seed(379)
+
+# heat map function
+plot_cm <- function(cm) {
+    cm_d <- as.data.frame(cm$table) # extract the confusion matrix values as data.frame
+    cm_st <- data.frame(cm$overall) # confusion matrix statistics as data.frame
+    cm_st$cm.overall <- round(cm_st$cm.overall, 4) # round the values
+    cm_d$diag <- cm_d$Prediction == cm_d$Reference # Get the Diagonal
+    cm_d$ndiag <- cm_d$Prediction != cm_d$Reference # Off Diagonal
+    cm_d$Reference <-  reverse.levels(cm_d$Reference) # diagonal starts at top left
+    cm_d$ref_freq <- cm_d$Freq * ifelse(is.na(cm_d$diag), -1, 1)
+    plt1 <-  ggplot(data = cm_d, aes(x = Prediction , y =  Reference, fill = Freq)) +
+        scale_x_discrete(position = "top") +
+        geom_tile(data = cm_d, aes(fill = ref_freq)) +
+        scale_fill_gradient2(
+            guide = FALSE ,
+            low = "green",
+            high = "red",
+            midpoint = 0,
+            na.value = 'white'
+        ) +
+        geom_text(aes(label = Freq), color = 'black', size = 3) +
+        theme_bw() +
+        theme(
+            legend.position = "none"
+        )
+     plt2 <- tableGrob(cm_st)
+    grid.arrange(plt1, plt2, nrow = 1, ncol = 2, 
+             top=textGrob("Confusion Matrix",gp=gpar(fontsize=25,font=1)))
+}
+```
+
+## Data Sets
+We are provided with 2 datasets.Training set with 19622 observations and 160 variables.
+And testing set with 20 observation and 160 variables which exclude `classe` replaced with `problem_id` for testing our prediction model.
+
+```{r}
+# URLs for data
+training_url <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+testing_url <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+# load data
+pml.training <- read.csv(training_url)
+pml.testing <- read.csv(testing_url)
+# check dimensions
+c(
+    training_vars = ncol(pml.training),
+    training_obs = nrow(pml.training),
+    testing_vars = ncol(pml.testing),
+    testing_obs = nrow(pml.testing)
+)
+```
+# Explore and Feature selections
+Reviewing the data and its sources we learn very little about what each variables means which makes it hard to know what is the right way to impute. We exclude variables with large missing variables and save as factors none numeric variables (`classe`, `user_name`, `window`). 
+```{r}
+tidy_train <- pml.training
+# remove columns with NA values since it is the majority of the observations
+tidy_train <- tidy_train[, colSums(is.na(tidy_train)) == 0]
+# removing variables with sparse records as well as variable X which seems to be a running number
+exclude_Variables <- c(1, 5, 12:20, 43:48, 52:60, 74:82)
+tidy_train <- tidy_train %>%
+    select(-any_of(exclude_Variables))
+
+# set as factors
+tidy_train$classe <- as.factor(tidy_train$classe) # classe
+tidy_train$user_name <- as.factor(tidy_train$user_name) # user_name
+tidy_train <- tidy_train %>%
+    mutate(new_window = if_else(new_window == "no", 0, 1)) # new_window
+
+# remove the same columns from our testing set and replace "classe" with problem_id
+tidy_test <- pml.testing %>%
+    select(c(colnames(tidy_train[, -58]), "problem_id"))
+# set factors as per training
+tidy_test$user_name <- as.factor(tidy_test$user_name) # user_name
+tidy_test <- tidy_test %>%
+    mutate(new_window = if_else(new_window == "no", 0, 1)) # new_window
+# check dimensions
+c(
+    training_vars = ncol(tidy_train),
+    training_obs = nrow(tidy_train),
+    testing_vars = ncol(tidy_test),
+    testing_obs = nrow(tidy_test)
+)
+
+```
+We are left with 58 observations.
+
+## Split Data to training, testing and validation 
+Our training dataset has 19,622 observations which is enough to split it into 3 sets. 
+We  put aside 20% of the records for validation at the end and split the remaining so that training has 60% and testing another 20%.
+```{r}
+# Partition data into build (train and test), and validation.
+inBuild <- createDataPartition(y = tidy_train$classe, p = 0.8, list = FALSE)
+validation <- tidy_train[-inBuild, ]
+buildData <- tidy_train[inBuild, ]
+# partition build data into training and testing sets.
+inTrain <- createDataPartition(y = buildData$classe, p = 0.75, list = FALSE)
+training <- buildData[inTrain, ]
+testing <- buildData[-inTrain, ]
+
+#check partitions
+format_p <- function(portion, total){
+    paste0(portion, " (",percent(portion / total), ")")
+}
+c(training = format_p(nrow(training), nrow(tidy_train)),
+testing = format_p(nrow(testing) , nrow(tidy_train)) ,
+validation = format_p(nrow(validation) , nrow(tidy_train)) , 
+total = format_p(nrow(tidy_train), nrow(tidy_train)))
+```
+## Fitting Different Models
+### Linear Discriminant Analysis
+First model we try is **Linear Discriminant Analysis**. We choose it because it can explain a categorical variable by the values of continuous independent variables. We will use 3 k-fold training control for **Cross Validation**.
+```{r , cache=TRUE}
+# train the model excluding categorical variables username and new_window
+mod_lda <- train(classe ~ ., 
+                 data = training[, -c(1,4)], 
+                 method = "lda",
+                 trainControl = trainControl(method = "cv", number = 3)
+                 )
+```
+
+### Predict and Evaluate
+```{r , cache=TRUE}
+# predict the testing outcomes
+p_lda <- predict(mod_lda, testing)
+```
+```{r}
+# compare prediction with test outcomes
+cm_lda <- confusionMatrix(testing$classe, p_lda)
+plot_cm(cm_lda)
+
+```
+
+We observe accuracy of 71%.
+
+## Random Forests
+Random Forest algorithms offer several advantages, including high accuracy, robustness to outliers and missing data, versatility for both classification and regression, and the ability to easily determine feature importance. We will need to use parallel processing for this one.
+```{r , message=FALSE, cache=TRUE}
+# register parallel processing
+cluster <- makeCluster(detectCores() - 1) # convention to leave 1 core for OS
+registerDoParallel(cluster)
+fit_control <- trainControl(method = "cv", number = 3, allowParallel = TRUE)
+# train model
+mod_rf <- train(classe ~ ., data = training, method = "rf", trControl = fit_control)
+# de-register parallel processing 
+stopCluster(cluster)
+registerDoSEQ()
+```
+### Predict and Evaluate 
+```{r}
+p_rf <- predict(mod_rf, testing)
+cm_rf <- confusionMatrix(testing$classe, p_rf)
+plot_cm(cm_rf)
+```
+
+Amazingly we observe accuracy of 99.9%!
+
+## Estimating Out of Sample Error
+```{r}
+p_rf_v <- predict(mod_rf, validation)
+cm_rf_v <- confusionMatrix(validation$classe, p_rf_v)
+
+plot_cm(cm_rf_v)
+```
+
+Accuracy is expected to be a little lower however it is still an impressive 99.8%.
+
+## Conclusion 
+Machine learning using Random Forest has great success at predicting the manner in which an exercise is preformed based on data collected from a variety of accelerometers. Some limitation include interpretability of the predictions. 
+
